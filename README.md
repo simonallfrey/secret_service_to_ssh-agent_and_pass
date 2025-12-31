@@ -1,131 +1,172 @@
-# Moving from Secret Service to ssh-agent + pass on Ubuntu
-
-## Introduction
-
-This report explains the rationale and process for transitioning from the GNOME Keyring (which implements the freedesktop.org Secret Service API) to a combination of OpenSSH's `ssh-agent` and the `pass` password manager (backed by GPG) for managing SSH keys and Git credentials on Ubuntu, particularly in headless environments. This move addresses limitations in GUI-dependent tools like GNOME Keyring, improving compatibility, security, and usability for server or CLI-only setups.
-
-The "Secret Service" refers to the secure storage system used by GNOME Keyring for passwords, tokens, and SSH key passphrases. We'll cover why this shift is beneficial, step-by-step instructions, and whether `ssh-agent + pass` aligns with industry best practices based on research from sources like Arch Wiki, Git documentation, and community discussions (e.g., Stack Exchange, Reddit).
-
-## Why Move from Secret Service (GNOME Keyring)?
-
-GNOME Keyring is excellent for desktop environments but falls short in headless scenarios:
-
-- **GUI Dependency**: It relies on a graphical session (e.g., X11/Wayland) for passphrase prompts and automatic unlocking via PAM. In headless Ubuntu Server or SSH-only sessions, prompts fail, leading to errors like "Connection refused" or repeated manual entries. The daemon expects D-Bus activation in a desktop context, making it unreliable without a display manager.
-
-- **Security and Reliability Issues**: Keys remain in memory without proper session locking, vulnerable to attacks (e.g., DMA). Conflicts arise with other agents (e.g., overriding `SSH_AUTH_SOCK`), and it's prone to bugs in non-GNOME setups. Upstream changes (e.g., separating SSH functionality into `gcr-ssh-agent` in GNOME 46+) have made it less default-friendly.
-
-- **Headless Limitations**: For servers, cron jobs, or containers, CLI tools are preferable. GNOME Keyring doesn't integrate well without forwarding (e.g., `ssh -X`), which isn't practical for automation.
-
-- **Performance and Flexibility**: `ssh-agent` is lightweight and scriptable, with features like key timeouts (`-t`) and confirmations (`-c`). `pass` adds GPG-encrypted storage for passphrases and credentials, enabling secure, automated unlocking without GUI prompts.
-
-This move enhances security (encrypted storage, no plain-text), portability (works across logins/sessions), and compatibility for developers using SSH/Git in mixed environments.
-
-## How to Move: For SSH Keys
-
-Transition to `ssh-agent` for in-memory key management, with `pass` storing passphrases for automatic unlocking.
-
-### Step 1: Disable GNOME Keyring SSH Integration
-Prevent conflicts:
 ```bash
-systemctl --user mask gcr-ssh-agent.socket gcr-ssh-agent.service gnome-keyring-daemon.socket
-unset SSH_AUTH_SOCK  # Add to ~/.bashrc for persistence
-```
+#!/usr/bin/env bash
+set -euo pipefail
 
-### Step 2: Set Up ssh-agent
-For automatic startup in headless sessions, add to `~/.bashrc`:
-```bash
-if ! pgrep -u "$USER" ssh-agent > /dev/null; then
-    ssh-agent -t 1h > "$XDG_RUNTIME_DIR/ssh-agent.env"  # 1-hour key lifetime
+# ================== CUSTOMIZE THESE (or leave defaults) ==================
+# Your main SSH private key filename(s) — space-separated
+SSH_KEYS="id_ed25519 id_rsa"
+
+# Your GPG key email or ID — WILL PROMPT IF LEFT AS DEFAULT
+GPG_KEY="your-email@example.com"
+
+# Optional: Common Git hosts for pre-creating pass folders
+GIT_HOSTS="github.com gitlab.com"
+# =========================================================================
+
+echo "=== Headless Secure Setup: ssh-agent (keychain) + pass + Git Credential Manager ==="
+echo "This script is fully idempotent — safe to run multiple times."
+echo
+
+# Prompt for GPG key if default placeholder is still there
+if [[ "$GPG_KEY" == "your-email@example.com" ]]; then
+    echo "No custom GPG key set. Listing your available secret keys:"
+    gpg --list-secret-keys --keyid-format LONG | grep -E '^sec|^uid' || echo "   (No secret keys found)"
+    echo
+    read -rp "Enter your GPG key ID or email to use with pass (required): " GPG_KEY
+    if [[ -z "$GPG_KEY" ]]; then
+        echo "Error: No GPG key provided — cannot continue without one."
+        exit 1
+    fi
+    echo "→ Using GPG key: $GPG_KEY"
+    echo
 fi
-if [ ! -f "$SSH_AUTH_SOCK" ]; then
-    source "$XDG_RUNTIME_DIR/ssh-agent.env" >/dev/null
+
+# 1. Install core apt packages
+echo "1. Installing core tools (pass, keychain, pinentry-tty, gnupg)..."
+sudo apt update -qq
+sudo apt install -y pass keychain pinentry-tty gnupg
+
+# 2. Install latest Git Credential Manager
+echo "2. Installing latest Git Credential Manager from GitHub..."
+GCM_DEB="/tmp/gcm-latest.deb"
+LATEST_URL=$(curl -s https://api.github.com/repos/git-ecosystem/git-credential-manager/releases/latest \
+    | grep "browser_download_url.*gcm-linux_amd64.*\.deb" \
+    | cut -d '"' -f 4)
+
+if [[ -z "$LATEST_URL" ]]; then
+    echo "Error: Could not find latest GCM release — check your internet connection."
+    exit 1
 fi
-```
-Source your shell: `source ~/.bashrc`.
 
-### Step 3: Integrate with pass for Passphrase Management
-Install `pass` and dependencies:
-```bash
-sudo apt install pass gnupg
-```
+wget -q --show-progress "$LATEST_URL" -O "$GCM_DEB"
+sudo dpkg -i --force-confold "$GCM_DEB" || sudo apt-get install -f -y
+rm -f "$GCM_DEB"
+git-credential-manager configure || true
 
-Initialize `pass` with a GPG key (generate one if needed):
-```bash
-gpg --full-generate-key  # Follow prompts for a strong key
-pass init your-gpg-key-id-or-email
-```
+# 3. Configure headless pinentry
+echo "3. Configuring terminal-only GPG prompts (headless friendly)..."
+mkdir -p ~/.gnupg
+if ! grep -q "pinentry-tty" ~/.gnupg/gpg-agent.conf 2>/dev/null; then
+    echo "pinentry-program /usr/bin/pinentry-tty" > ~/.gnupg/gpg-agent.conf
+fi
+gpg-connect-agent reloadagent /bye >/dev/null
 
-Store your SSH key passphrase in `pass` (e.g., for `~/.ssh/id_ed25519`):
-```bash
-pass insert ssh/my-key-passphrase
-```
+# 4. Initialize pass (idempotent)
+echo "4. Initializing/validating Password Store (pass)..."
+if ! pass ls >/dev/null 2>&1; then
+    echo "   Initializing pass with your GPG key..."
+    pass init "$GPG_KEY"
+else
+    echo "   pass already initialized"
+fi
 
-Create a script for automatic unlocking (e.g., `~/unlock-ssh.sh`):
-```bash
-#!/bin/bash
-export SSH_ASKPASS=/usr/bin/pass
-ssh-add -t 1h ~/.ssh/id_ed25519 <<< $(pass ssh/my-key-passphrase)
-```
-Make executable: `chmod +x ~/unlock-ssh.sh`. Run on demand or add to startup.
+# 5. Disable conflicting GNOME agents
+echo "5. Masking GNOME/GCR agents to prevent conflicts..."
+systemctl --user mask --now gcr-ssh-agent.socket gcr-ssh-agent.service gnome-keyring-daemon.socket || true
 
-For persistence across sessions, use `keychain` (wraps `ssh-agent`):
-```bash
-sudo apt install keychain
-```
-Add to `~/.bashrc`:
-```bash
-eval $(keychain --eval --quiet --nogui id_ed25519)  # --nogui for terminal prompts
-```
-This prompts once per boot, using `pass` for retrieval if scripted.
+# 6. Add keychain startup to shell files (idempotent)
+echo "6. Adding keychain to shell startup files..."
+for file in ~/.bashrc ~/.profile; do
+    if ! grep -q "keychain.*--nogui" "$file" 2>/dev/null; then
+        cat >> "$file" <<EOF
 
-Verify: `ssh-add -l` should list keys.
+# --- keychain: headless ssh-agent management ---
+eval \$(keychain --eval --quiet --nogui $SSH_KEYS)
+# -------------------------------------------------------
+EOF
+        echo "   Added to $file"
+    fi
+done
 
-## How to Move: For Git Credentials
-
-Git Credential Manager (GCM) defaults to `secretservice` on desktops but fails headless. Switch to GPG with `pass`.
-
-### Step 1: Install and Configure
-```bash
-sudo apt install git-credential-manager pass  # Assuming GCM is installed
-pass init  # If not done
-```
-
-### Step 2: Switch Credential Store
-```bash
+# 7. Configure GCM to use GPG/pass backend
+echo "7. Configuring Git Credential Manager to use secure GPG backend..."
 git config --global credential.credentialStore gpg
+
+# Optional: pre-create common host folders
+if [[ -n "$GIT_HOSTS" ]]; then
+    echo "8. Pre-creating pass folders for common Git hosts..."
+    for host in $GIT_HOSTS; do
+        pass mkdir -p "git/$host" 2>/dev/null || true
+    done
+fi
+
+# ====================== VERIFICATION ======================
+echo
+echo "=== VERIFICATION: Checking your installation ==="
+
+passed=true
+
+command -v keychain >/dev/null && echo "✓ keychain installed" || { echo "✗ keychain missing"; passed=false; }
+command -v pass >/dev/null && pass ls >/dev/null 2>&1 && echo "✓ pass installed and initialized" || { echo "✗ pass issue"; passed=false; }
+command -v git-credential-manager >/dev/null && echo "✓ Git Credential Manager installed" || { echo "✗ GCM missing"; passed=false; }
+git config --global credential.credentialStore | grep -q "gpg" && echo "✓ GCM using GPG backend" || { echo "⚠ GCM not using gpg store"; passed=false; }
+
+eval "$(keychain --eval --quiet --nogui $SSH_KEYS 2>/dev/null || true)"
+[[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]] && echo "✓ ssh-agent running" || { echo "✗ ssh-agent not running"; passed=false; }
+
+if $passed; then
+    echo
+    echo "🎉 SUCCESS! Your headless setup is complete and verified."
+else
+    echo
+    echo "⚠ Some checks failed — please review above and re-run the script."
+    exit 1
+fi
+
+# ====================== HOW TO CHECK & DAILY WORKFLOW ======================
+echo
+echo "=========================================================================="
+echo "                           YOUR NEW WORKFLOW"
+echo "=========================================================================="
+echo
+echo "1. How to verify everything is working (run anytime):"
+echo "   Open a new terminal and run:"
+echo "       ssh-add -l                     # Lists loaded keys"
+echo "       ssh -T git@github.com          # Test SSH to GitHub"
+echo "       git ls-remote https://github.com/some/repo.git   # Test HTTPS"
+echo
+echo "2. Daily workflow (what happens automatically now):"
+echo "   • Every new terminal or SSH login:"
+echo "       → keychain starts/reuses ssh-agent"
+echo "       → Your keys ($SSH_KEYS) are added automatically"
+echo "       → If passphrase-protected: you are prompted ONCE in the terminal"
+echo
+echo "   • Git over SSH: no prompts ever (after first key add)"
+echo
+echo "   • Git over HTTPS:"
+echo "       → First time per host: enter username + token/PAT in terminal"
+echo "       → Credential is encrypted with your GPG key and stored in pass"
+echo "       → All future operations: completely silent"
+echo
+echo "3. Optional: Make SSH completely silent (zero passphrase prompts)"
+echo "   If you want no prompts at all:"
+echo "       ssh-add ~/.ssh/id_ed25519      # enter passphrase once"
+echo "       pass insert -e ssh/id_ed25519-passphrase"
+echo "   (Advanced users can script pulling from pass)"
+echo
+echo "You're all set! Enjoy a secure, headless, zero-maintenance workflow. 🚀"
+echo
 ```
-This uses GPG-encrypted storage via `pass` (in `~/.password-store/`).
 
-For temporary in-memory caching (less persistent):
-```bash
-git config --global credential.helper cache --timeout=3600  # 1 hour
-```
+### Features of this final version
 
-Store credentials: On first `git push/pull` over HTTPS, enter once; `pass` encrypts them.
+- **Fully idempotent** — can be run repeatedly without side effects.
+- **User-friendly GPG prompt** — lists your keys and forces a valid entry.
+- **Robust GCM install** — pulls the absolute latest version safely.
+- **Clear step-by-step progress** with numbered sections.
+- **Built-in verification** — fails loudly if anything is wrong.
+- **Comprehensive final explanation** — tells the user exactly how to check the install and what their daily workflow now looks like.
 
-Custom helper for `pass`: Use `git-credential-pass` (from AUR/contribs) or script:
-```bash
-git config --global credential.helper '!f() { pass git/credentials; }; f'
-```
+Save as `install.sh`, `chmod +x install.sh`, run it once — and you're done forever.
 
-## Is ssh-agent + pass Industry Best Practice?
-
-Yes, `ssh-agent + pass` is widely regarded as an industry best practice for security-conscious developers on Linux, especially in headless environments. Research highlights:
-
-- **Community Endorsement**: Tools like `pass` (the "standard Unix password manager") are praised for geek/developer workflows (e.g., Reddit discussions on self-hosting and API key management). Integrations with `ssh-agent` for unlocking are common in Stack Exchange and personal blogs, providing automated, encrypted access without GUI.
-
-- **Security Benefits**: SSH keys over passwords are standard (Git docs, Atlassian tutorials). `pass` uses GPG for encryption, avoiding plain-text storage—superior to GNOME Keyring's memory vulnerabilities. Best practices include key rotation, strong algorithms (Ed25519), and timeouts (BeyondTrust, Teleport guides).
-
-- **Headless Suitability**: Arch Wiki recommends standalone `ssh-agent` with `keychain` or `pass` for servers, explicitly noting GNOME Keyring's unsuitability. Git docs advocate GPG/`pass` for credential storage over unencrypted options.
-
-- **Adoption**: Used in DevOps (e.g., automating SSH in scripts), with alternatives like KeePassXC for similar integration. While enterprise tools (e.g., Keeper, Bitwarden) offer SSH agents, `pass` is lightweight and FOSS-preferred for individual developers.
-
-It's not universal (e.g., desktops may stick with Keyring), but for headless Ubuntu, it's efficient and secure.
-
-## Conclusion
-
-This transition streamlines your workflow for headless Ubuntu 24.04+, resolving GUI dependencies while enhancing security. Test in a non-production environment first. For further customization, refer to [[Arch Wiki SSH Keys]] or Git docs.
-
---- 
-
-*Last updated: December 31, 2025*
+Let me know when you run it and what the final output says — you should get that big "SUCCESS!" message and a clean workflow from now on! 🎉
